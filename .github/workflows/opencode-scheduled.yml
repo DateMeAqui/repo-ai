@@ -7,6 +7,10 @@ on:
 jobs:
   opencode:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: opencode-scheduled
+      cancel-in-progress: true
     permissions:
       id-token: write
       contents: write
@@ -18,13 +22,61 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Run OpenCode
-        uses: anomalyco/opencode/github@latest
+      - name: Configure git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Detect recent commits (7 days)
+        id: recent
+        run: |
+          if git log --since="7 days ago" --oneline | grep -q .; then
+            echo "has_recent=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_recent=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Detect TODO/FIXME
+        id: todos
+        run: |
+          if git grep -nE "TODO|FIXME" -- . ':!node_modules' ':!.git' | grep -q .; then
+            echo "has_todos=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_todos=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Decide execution
+        id: decision
+        run: |
+          if [ "${{ steps.recent.outputs.has_recent }}" = "true" ] || [ "${{ steps.todos.outputs.has_todos }}" = "true" ]; then
+            echo "run=true" >> $GITHUB_OUTPUT
+            echo "Proceeding with OpenCode run"
+          else
+            echo "run=false" >> $GITHUB_OUTPUT
+            echo "No recent changes and no TODOs found. Skipping."
+          fi
+
+      - name: Run OpenCode (with retry)
+        if: steps.decision.outputs.run == 'true'
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          model: ollama/glm-5:cloud
-          prompt: |
-            Revise a base de código para quaisquer comentários TODO e crie um resumo.
-            Se encontrar problemas que valham a pena resolver, abra um issue para rastreá-los.
+        run: |
+          set -e
+          ATTEMPTS=3
+          COUNT=0
+          until [ $COUNT -ge $ATTEMPTS ]
+          do
+            echo "Attempt $(($COUNT+1))/$ATTEMPTS"
+            if npx -y anomalyco/opencode@latest github run \
+              --model openai/gpt-4o-mini \
+              --prompt "Revise a base de código buscando problemas reais. Prioridades: bugs reais, código perigoso/inconsistente e TODOs relevantes. Regras: NÃO criar issues para melhorias triviais; NÃO criar duplicadas; só criar issue se realmente exigir ação. Se não houver problemas relevantes, responda apenas com um resumo."; then
+              echo "Success"
+              exit 0
+            fi
+            COUNT=$(($COUNT+1))
+            echo "Retrying in 10s..."
+            sleep 10
+          done
+          echo "All attempts failed"
+          exit 1
